@@ -52,6 +52,10 @@ validation failed, run:
 Training writes `final.ckpt` plus `training_metadata.json` only after complete
 validation succeeds.
 
+Training loss is logged once per optimizer update. With gradient accumulation,
+each `train/*_step` value is the sum of the micro-batch losses after applying
+the same accumulation scaling used by Lightning for backward.
+
 Before a long run, the two optional checks are:
 
 ```powershell

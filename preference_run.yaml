@@ -21,7 +21,7 @@ preference:
   num_negatives: 2
   beta: 1.0
   target_margin: 0.0
-  positive_ctc_weight: 0.1
+  positive_ctc_weight: 0.5
 
 calibration:
   sample_count: 10000
@@ -42,7 +42,7 @@ logging:
   tensorboard: true
   save_dir: "E:/hard_cityu/SimPONovo/preference_output/tensorboard"
   run_name_prefix: "simponovo_k2"
-  train_log_every_n_steps: 50
+  train_log_every_n_steps: 1
   tensorboard_flush_secs: 30
   val_subset_size: 2048
   val_subset_seed: 6558

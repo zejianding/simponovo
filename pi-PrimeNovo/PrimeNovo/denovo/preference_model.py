@@ -39,6 +39,9 @@ class PreferenceSpec2Pep(Spec2Pep):
         self.positive_ctc_weight = positive_ctc_weight
         self.preference_warmup_steps = warmup_steps
         self.preference_total_optimizer_steps = max(total_optimizer_steps, 1)
+        self._optimizer_step_metric_sums: Dict[str, torch.Tensor] = {}
+        self._optimizer_step_micro_batches = 0
+        self._last_logged_optimizer_step = 0
 
     def score_ctc_candidates(
         self,
@@ -141,25 +144,51 @@ class PreferenceSpec2Pep(Spec2Pep):
             raise TypeError("Preference batch is missing spectrum tensors")
         logits, _, _ = self._forward_step(spectra, precursors, positive_peptides)
         losses = self.compute_preference_losses(logits, positive_peptides, negative_peptides)
-        prefix = "train" if stage == "train" else "val"
-        log_kwargs = dict(on_step=stage == "train", on_epoch=True, sync_dist=True, batch_size=spectra.shape[0])
-        self.log(f"{prefix}/simpo_loss", losses["simpo_loss"], **log_kwargs)
-        self.log(f"{prefix}/positive_ctc_loss", losses["positive_ctc_loss"], **log_kwargs)
-        self.log(
-            f"{prefix}/total_loss",
-            losses["total_loss"],
-            prog_bar=stage == "train",
-            **log_kwargs,
-        )
-        self.log(f"{prefix}/positive_reward", losses["positive_rewards"].mean(), **log_kwargs)
-        self.log(f"{prefix}/negative_reward_mean", losses["negative_rewards"].mean(), **log_kwargs)
-        self.log(f"{prefix}/reward_margin_mean", losses["margins"].mean(), **log_kwargs)
-        self.log(
-            f"{prefix}/preference_accuracy",
-            (losses["margins"] > 0).float().mean(),
-            **log_kwargs,
-        )
+        metrics = {
+            "total_loss": losses["total_loss"],
+            "simpo_loss": losses["simpo_loss"],
+            "positive_ctc_loss": losses["positive_ctc_loss"],
+            "positive_reward": losses["positive_rewards"].mean(),
+            "negative_reward_mean": losses["negative_rewards"].mean(),
+            "reward_margin_mean": losses["margins"].mean(),
+            "preference_accuracy": (losses["margins"] > 0).float().mean(),
+        }
+        if stage == "train":
+            self._accumulate_optimizer_step_metrics(metrics)
+            epoch_log_kwargs = dict(
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=spectra.shape[0],
+            )
+            for name, value in metrics.items():
+                self.log(f"train/{name}_epoch", value, **epoch_log_kwargs)
+        else:
+            val_log_kwargs = dict(
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=spectra.shape[0],
+            )
+            for name, value in metrics.items():
+                self.log(f"val/{name}", value, **val_log_kwargs)
         return losses["total_loss"]
+
+    def _accumulate_optimizer_step_metrics(self, metrics: Dict[str, torch.Tensor]) -> None:
+        """Accumulate detached micro-batch metrics until the next optimizer update."""
+        for name, value in metrics.items():
+            detached = value.detach().float()
+            if name not in self._optimizer_step_metric_sums:
+                self._optimizer_step_metric_sums[name] = detached.clone()
+            else:
+                self._optimizer_step_metric_sums[name] = (
+                    self._optimizer_step_metric_sums[name] + detached
+                )
+        self._optimizer_step_micro_batches += 1
+
+    def _reset_optimizer_step_metrics(self) -> None:
+        self._optimizer_step_metric_sums.clear()
+        self._optimizer_step_micro_batches = 0
 
     def training_step(self, batch: Dict[str, object], batch_idx: int) -> torch.Tensor:
         return self._shared_step(batch, "train")
@@ -173,8 +202,43 @@ class PreferenceSpec2Pep(Spec2Pep):
     def on_validation_epoch_end(self) -> None:
         """Disable legacy decode-metric aggregation during Windows training."""
 
+    def on_train_start(self) -> None:
+        """Initialize accumulation-aware logging, including after checkpoint resume."""
+        self._reset_optimizer_step_metrics()
+        self._last_logged_optimizer_step = int(self.trainer.global_step)
+
     def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
-        """Disable legacy SummaryWriter-specific gradient logging."""
+        """Log exactly one accumulated metric set for each optimizer update."""
+        optimizer_step = int(self.trainer.global_step)
+        if optimizer_step <= self._last_logged_optimizer_step:
+            return
+        if self._optimizer_step_micro_batches <= 0:
+            raise RuntimeError("Optimizer step completed without accumulated train metrics")
+
+        accumulation_steps = int(self.trainer.accumulate_grad_batches)
+        if accumulation_steps <= 0:
+            raise RuntimeError("accumulate_grad_batches must be positive")
+        loss_names = {"total_loss", "simpo_loss", "positive_ctc_loss"}
+        for name, metric_sum in self._optimizer_step_metric_sums.items():
+            if name in loss_names:
+                # Lightning divides every micro-batch loss by the configured
+                # accumulation factor before backward.  Summing those scaled
+                # losses reproduces the objective that produced this update,
+                # including the final incomplete accumulation window.
+                value = metric_sum / accumulation_steps
+            else:
+                value = metric_sum / self._optimizer_step_micro_batches
+            self.log(
+                f"train/{name}_step",
+                value,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=True,
+                logger=True,
+                prog_bar=name == "total_loss",
+            )
+        self._last_logged_optimizer_step = optimizer_step
+        self._reset_optimizer_step_metrics()
 
     def on_before_optimizer_step(self, optimizer, optimizer_idx=None) -> None:
         """TensorBoard-safe replacement for the legacy dict-style logger hook."""
