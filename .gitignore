@@ -1,0 +1,43 @@
+# Local Python environments and caches
+simponovo/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Generated training outputs and logs
+preference_output/
+lightning_logs/
+wandb/
+*.log
+*.out
+*.err
+**/output.txt
+*.tmp
+
+# Large model/data artifacts (keep code and configs in the repository)
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.mgf
+*.parquet
+*.lmdb
+*.lmdb-lock
+*.npy
+*.npz
+
+# Local repository metadata for the two source trees
+pi-PrimeNovo/.git/
+SimPO/.git/
+**/.git.codex-upload-backup/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

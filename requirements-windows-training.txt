@@ -1,0 +1,12 @@
+# Windows preference-training environment. Linux-only inference dependencies
+# (ctcdecode and CuPy/PMC) are intentionally excluded.
+pytorch-lightning==2.5.1
+pyarrow>=14.0.0
+lmdb>=1.4.1
+PyYAML>=6.0
+numpy>=1.26,<3
+spectrum-utils==0.4.1
+depthcharge-ms==0.1.0
+einops>=0.6.0
+tensorboard>=2.10
+psutil>=5.9

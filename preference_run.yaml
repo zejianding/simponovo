@@ -1,0 +1,55 @@
+base_config: "pi-PrimeNovo/PrimeNovo/config.yaml"
+
+data:
+  train_mgf: "D:/data_backup/massivekb/preference_k2_training_v1/train.mgf"
+  train_parquet: "D:/data_backup/massivekb/preference_k2_training_v1/train.parquet"
+  train_lmdb: "D:/data_backup/massivekb/preference_k2_training_v1/train.preference.compact.lmdb"
+  val_mgf: "D:/data_backup/massivekb/preference_k2_training_v1/val.mgf"
+  val_parquet: "D:/data_backup/massivekb/preference_k2_training_v1/val.parquet"
+  val_lmdb: "D:/data_backup/massivekb/preference_k2_training_v1/val.preference.compact.lmdb"
+  num_workers: 4
+  preprocessing:
+    n_peaks: 800
+    min_mz: 1.0
+    max_mz: 6500.0
+    min_intensity: 0.0
+    remove_precursor_tol: 1.0
+
+model: {}
+
+preference:
+  num_negatives: 2
+  beta: 1.0
+  target_margin: 0.0
+  positive_ctc_weight: 0.1
+
+calibration:
+  sample_count: 10000
+  batch_size: 8
+  seed: 6558
+  output_json: "E:/hard_cityu/SimPONovo/preference_output/reward_calibration.json"
+
+training:
+  base_checkpoint: "E:/hard_cityu/SimPONovo/pi-PrimeNovo/model_massive.ckpt"
+  output_dir: "E:/hard_cityu/SimPONovo/preference_output"
+  learning_rate: 1.0e-5
+  weight_decay: 8.0e-5
+  gradient_clip_val: 2.5
+  effective_batch_size: 128
+  warmup_ratio: 0.1
+
+logging:
+  tensorboard: true
+  save_dir: "E:/hard_cityu/SimPONovo/preference_output/tensorboard"
+  run_name_prefix: "simponovo_k2"
+  train_log_every_n_steps: 50
+  tensorboard_flush_secs: 30
+  val_subset_size: 2048
+  val_subset_seed: 6558
+  val_subset_interval_optimizer_steps: 1000
+
+checkpointing:
+  rolling_interval_optimizer_steps: 2000
+  last_path: "E:/hard_cityu/SimPONovo/preference_output/last.ckpt"
+  final_path: "E:/hard_cityu/SimPONovo/preference_output/final.ckpt"
+  auto_resume: true

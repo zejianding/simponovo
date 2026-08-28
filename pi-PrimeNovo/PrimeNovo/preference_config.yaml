@@ -1,0 +1,39 @@
+base_config: "config.yaml"
+
+data:
+  train_mgf: ""
+  train_parquet: ""
+  train_lmdb: ""
+  val_mgf: ""
+  val_parquet: ""
+  val_lmdb: ""
+  num_workers: 0
+  preprocessing:
+    n_peaks: 800
+    min_mz: 1.0
+    max_mz: 6500.0
+    min_intensity: 0.0
+    remove_precursor_tol: 1.0
+
+model: {}
+
+preference:
+  num_negatives: 2
+  beta: 1.0
+  target_margin: 0.0
+  positive_ctc_weight: 0.1
+
+calibration:
+  sample_count: 10000
+  batch_size: 8
+  seed: 6558
+  output_json: "reward_calibration.json"
+
+training:
+  base_checkpoint: "model_massive.ckpt"
+  output_dir: "preference_output"
+  learning_rate: 1.0e-5
+  weight_decay: 8.0e-5
+  gradient_clip_val: 2.5
+  effective_batch_size: 128
+  warmup_ratio: 0.1
