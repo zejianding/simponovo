@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Tuple
 
 import pytorch_lightning as pl
@@ -25,6 +26,7 @@ class PreferenceSpec2Pep(Spec2Pep):
         positive_ctc_weight: float = 0.1,
         warmup_steps: int = 0,
         total_optimizer_steps: int = 1,
+        cosine_min_lr_ratio: float = 0.0,
         enable_inference_decoder: bool = False,
         **kwargs,
     ) -> None:
@@ -32,6 +34,8 @@ class PreferenceSpec2Pep(Spec2Pep):
             raise ValueError("num_negatives must be at least one")
         if beta <= 0:
             raise ValueError("beta must be positive")
+        if not 0.0 <= cosine_min_lr_ratio <= 1.0:
+            raise ValueError("cosine_min_lr_ratio must be between zero and one")
         super().__init__(enable_inference_decoder=enable_inference_decoder, **kwargs)
         self.num_negatives = num_negatives
         self.beta = beta
@@ -39,6 +43,7 @@ class PreferenceSpec2Pep(Spec2Pep):
         self.positive_ctc_weight = positive_ctc_weight
         self.preference_warmup_steps = warmup_steps
         self.preference_total_optimizer_steps = max(total_optimizer_steps, 1)
+        self.cosine_min_lr_ratio = cosine_min_lr_ratio
         self._optimizer_step_metric_sums: Dict[str, torch.Tensor] = {}
         self._optimizer_step_micro_batches = 0
         self._last_logged_optimizer_step = 0
@@ -259,11 +264,16 @@ class PreferenceSpec2Pep(Spec2Pep):
         optimizer = torch.optim.AdamW(self.parameters(), **self.opt_kwargs)
 
         def lr_lambda(step: int) -> float:
-            if self.preference_warmup_steps <= 0:
-                return 1.0
-            if step < self.preference_warmup_steps:
+            warmup_steps = self.preference_warmup_steps
+            total_steps = self.preference_total_optimizer_steps
+            if warmup_steps > 0 and step < warmup_steps:
                 return float(step + 1) / float(self.preference_warmup_steps)
-            return 1.0
+            decay_steps = total_steps - warmup_steps
+            if decay_steps <= 1:
+                return self.cosine_min_lr_ratio
+            progress = min(max((step - warmup_steps) / float(decay_steps - 1), 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return self.cosine_min_lr_ratio + (1.0 - self.cosine_min_lr_ratio) * cosine
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {

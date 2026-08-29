@@ -35,15 +35,15 @@ at least `num_negatives` ordered peptides in `negative_peptides`.
 .\simponovo\Scripts\python.exe .\scripts\run_preference_training.py build-cache --config <config.yaml>
 .\simponovo\Scripts\python.exe .\scripts\run_preference_training.py compact-cache --config <config.yaml>
 .\simponovo\Scripts\python.exe .\scripts\run_preference_training.py calibrate --config <config.yaml>
-.\simponovo\Scripts\python.exe .\scripts\run_preference_training.py train --config <config.yaml> [--fresh]
+.\simponovo\Scripts\python.exe .\scripts\run_preference_training.py train --config <config.yaml> --fresh
 ```
 
 `compact-cache` preserves the original LMDBs and validates deterministic
 records before publishing `*.compact.lmdb`; update the config to those files
 after the command succeeds. Calibration writes `reward_calibration.json` once.
 Training automatically resumes from `last.ckpt`; `--fresh` archives the old
-rolling checkpoint and fingerprint. If training finished its train epoch but
-validation failed, run:
+`best.ckpt`, `last.ckpt`, `final.ckpt`, metric state, and fingerprint. If
+training finished its train epoch but validation failed, run:
 
 ```powershell
 .\simponovo\Scripts\python.exe .\scripts\run_preference_training.py validate-last --config <config.yaml>
@@ -51,6 +51,12 @@ validation failed, run:
 
 Training writes `final.ckpt` plus `training_metadata.json` only after complete
 validation succeeds.
+
+The training schedule uses a linear warm-up for the first 10% of optimizer
+steps and cosine decay for the remaining 90%, ending at `min_learning_rate`.
+The fixed validation subset is evaluated every configured interval and saves
+`best.ckpt` whenever `monitor/val_subset_total_loss` reaches a new minimum.
+Each completed run keeps `best.ckpt`, rolling `last.ckpt`, and `final.ckpt`.
 
 Training loss is logged once per optimizer update. With gradient accumulation,
 each `train/*_step` value is the sum of the micro-batch losses after applying

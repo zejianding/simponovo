@@ -72,6 +72,12 @@ def model_kwargs(config: dict, *, warmup_steps: int = 0, total_steps: int = 1) -
     model = config["model"]
     training = config["training"]
     preference = config["preference"]
+    learning_rate = float(training["learning_rate"])
+    min_learning_rate = float(training.get("min_learning_rate", 0.0))
+    if training.get("scheduler", "cosine") != "cosine":
+        raise ValueError("Preference training currently requires scheduler: cosine")
+    if learning_rate <= 0 or not 0.0 <= min_learning_rate <= learning_rate:
+        raise ValueError("min_learning_rate must be between zero and learning_rate")
     return {
         "dim_model": model["dim_model"],
         "n_head": model["n_head"],
@@ -93,7 +99,8 @@ def model_kwargs(config: dict, *, warmup_steps: int = 0, total_steps: int = 1) -
         "positive_ctc_weight": preference["positive_ctc_weight"],
         "warmup_steps": warmup_steps,
         "total_optimizer_steps": total_steps,
-        "lr": training["learning_rate"],
+        "cosine_min_lr_ratio": min_learning_rate / learning_rate,
+        "lr": learning_rate,
         "weight_decay": training["weight_decay"],
     }
 
@@ -117,13 +124,43 @@ def make_datamodule(config: dict, batch_size: int) -> PreferenceDataModule:
     )
 
 
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(str(path) + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        temporary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(str(temporary_path), str(path))
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 class PeriodicValidationSubsetCallback(Callback):
     """Evaluate one fixed validation subset without re-entering Trainer.validate."""
 
-    def __init__(self, subset_loader: DataLoader, interval_optimizer_steps: int) -> None:
+    def __init__(
+        self,
+        subset_loader: DataLoader,
+        interval_optimizer_steps: int,
+        best_path: str | Path,
+    ) -> None:
         self.subset_loader = subset_loader
         self.interval_optimizer_steps = interval_optimizer_steps
+        self.best_path = Path(best_path)
+        self.best_state_path = Path(str(self.best_path) + ".json")
         self.last_evaluated_step = -1
+        self.best_loss = float("inf")
+        self.best_step = -1
+        best_exists = self.best_path.is_file()
+        state_exists = self.best_state_path.is_file()
+        if best_exists != state_exists:
+            raise RuntimeError(
+                "best.ckpt and its metric state are inconsistent; use --fresh to archive them"
+            )
+        if state_exists:
+            state = json.loads(self.best_state_path.read_text(encoding="utf-8"))
+            self.best_loss = float(state["best_val_subset_total_loss"])
+            self.best_step = int(state["best_step"])
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
         step = trainer.global_step
@@ -153,18 +190,64 @@ class PeriodicValidationSubsetCallback(Callback):
                     count += batch_size
                     for key in totals:
                         totals[key] += float(losses[key].detach()) * batch_size
-            if count == 0:
-                raise RuntimeError("Validation subset is empty")
-            writer = trainer.logger.experiment
-            writer.add_scalar("monitor/val_subset_total_loss", totals["total_loss"] / count, step)
-            writer.add_scalar("monitor/val_subset_simpo_loss", totals["simpo_loss"] / count, step)
-            writer.add_scalar(
-                "monitor/val_subset_positive_ctc_loss", totals["positive_ctc_loss"] / count, step
-            )
-            writer.flush()
         finally:
             if was_training:
                 pl_module.train()
+        if count == 0:
+            raise RuntimeError("Validation subset is empty")
+        metrics = {key: value / count for key, value in totals.items()}
+        writer = trainer.logger.experiment
+        writer.add_scalar("monitor/val_subset_total_loss", metrics["total_loss"], step)
+        writer.add_scalar("monitor/val_subset_simpo_loss", metrics["simpo_loss"], step)
+        writer.add_scalar(
+            "monitor/val_subset_positive_ctc_loss", metrics["positive_ctc_loss"], step
+        )
+        if metrics["total_loss"] < self.best_loss:
+            previous_loss, previous_step = self.best_loss, self.best_step
+            self.best_loss = float(metrics["total_loss"])
+            self.best_step = int(step)
+            try:
+                _atomic_save_checkpoint(trainer, self.best_path)
+                _atomic_write_json(
+                    self.best_state_path,
+                    {
+                        "best_val_subset_total_loss": self.best_loss,
+                        "best_step": self.best_step,
+                        "best_checkpoint_path": str(self.best_path),
+                    },
+                )
+            except Exception:
+                self.best_loss, self.best_step = previous_loss, previous_step
+                raise
+            writer.add_scalar("checkpoint/best_val_subset_total_loss", self.best_loss, step)
+            writer.add_scalar("checkpoint/best_saved_step", step, step)
+            print(
+                f"\nSaved best checkpoint: {self.best_path} "
+                f"(global_step={step}, val_subset_total_loss={self.best_loss:.6f})",
+                flush=True,
+            )
+        writer.flush()
+
+    def state_dict(self) -> dict:
+        return {
+            "interval_optimizer_steps": self.interval_optimizer_steps,
+            "last_evaluated_step": self.last_evaluated_step,
+            "best_loss": self.best_loss,
+            "best_step": self.best_step,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        saved_interval = int(state_dict.get("interval_optimizer_steps", self.interval_optimizer_steps))
+        if saved_interval != self.interval_optimizer_steps:
+            raise ValueError(
+                "Validation subset interval does not match the checkpoint: "
+                f"{saved_interval} != {self.interval_optimizer_steps}"
+            )
+        self.last_evaluated_step = int(state_dict.get("last_evaluated_step", -1))
+        saved_loss = float(state_dict.get("best_loss", float("inf")))
+        if saved_loss < self.best_loss:
+            self.best_loss = saved_loss
+            self.best_step = int(state_dict.get("best_step", -1))
 
 
 def _atomic_save_checkpoint(trainer: pl.Trainer, path: Path) -> None:
@@ -280,7 +363,11 @@ def log_resume_info(logger: TensorBoardLogger, resume_info: dict) -> None:
 
 
 def make_validation_subset_callback(
-    config: dict, module: PreferenceDataModule, batch_size: int, output_dir: Path
+    config: dict,
+    module: PreferenceDataModule,
+    batch_size: int,
+    output_dir: Path,
+    best_path: Path,
 ) -> PeriodicValidationSubsetCallback:
     logging_config = config["logging"]
     subset_size = min(logging_config["val_subset_size"], len(module.val_dataset))
@@ -298,7 +385,9 @@ def make_validation_subset_callback(
         collate_fn=preference_collate,
     )
     return PeriodicValidationSubsetCallback(
-        subset_loader, logging_config["val_subset_interval_optimizer_steps"]
+        subset_loader,
+        logging_config["val_subset_interval_optimizer_steps"],
+        best_path,
     )
 
 
@@ -390,6 +479,8 @@ def make_run_fingerprint(
         "micro_batch_size": int(micro_batch),
         "gradient_accumulation_steps": int(accumulation),
         "learning_rate": float(training["learning_rate"]),
+        "scheduler": str(training.get("scheduler", "cosine")),
+        "min_learning_rate": float(training.get("min_learning_rate", 0.0)),
         "weight_decay": float(training["weight_decay"]),
         "warmup_steps": int(warmup_steps),
         "total_optimizer_steps": int(optimizer_steps),
@@ -401,7 +492,16 @@ def make_run_fingerprint(
     return {"schema_version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "values": values}
 
 
-def _archive_resume_files(output_dir: Path, last_path: Path, fingerprint_path: Path) -> Path:
+def _checkpoint_paths(config: dict, output_dir: Path) -> tuple[Path, Path, Path]:
+    checkpointing = config.get("checkpointing", {})
+    return (
+        Path(checkpointing.get("last_path", output_dir / "last.ckpt")),
+        Path(checkpointing.get("best_path", output_dir / "best.ckpt")),
+        Path(checkpointing.get("final_path", output_dir / "final.ckpt")),
+    )
+
+
+def _archive_resume_files(output_dir: Path, paths: list[Path]) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     archive_dir = output_dir / "checkpoint_archive" / timestamp
     suffix = 1
@@ -409,7 +509,7 @@ def _archive_resume_files(output_dir: Path, last_path: Path, fingerprint_path: P
         archive_dir = output_dir / "checkpoint_archive" / f"{timestamp}_{suffix}"
         suffix += 1
     archive_dir.mkdir(parents=True, exist_ok=False)
-    for path in (last_path, fingerprint_path):
+    for path in paths:
         if path.is_file():
             shutil.move(str(path), str(archive_dir / path.name))
     return archive_dir
@@ -424,15 +524,23 @@ def prepare_resume(
 ) -> tuple[Path | None, Path, dict]:
     checkpointing = config.get("checkpointing", {})
     auto_resume = bool(checkpointing.get("auto_resume", True))
-    last_path = Path(checkpointing.get("last_path", output_dir / "last.ckpt"))
+    last_path, best_path, final_path = _checkpoint_paths(config, output_dir)
     fingerprint_path = output_dir / "run_fingerprint.json"
+    best_state_path = Path(str(best_path) + ".json")
     if fresh:
-        if last_path.is_file() or fingerprint_path.is_file():
-            archive_dir = _archive_resume_files(output_dir, last_path, fingerprint_path)
+        archive_paths = [last_path, best_path, best_state_path, final_path, fingerprint_path]
+        if any(path.is_file() for path in archive_paths):
+            archive_dir = _archive_resume_files(output_dir, archive_paths)
             print(f"Archived previous resume state to {archive_dir}", flush=True)
         fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return None, last_path, {"resumed": False, "source": None}
     if not auto_resume:
+        stale_paths = [last_path, best_path, best_state_path, final_path, fingerprint_path]
+        if any(path.is_file() for path in stale_paths):
+            raise RuntimeError(
+                "Checkpoint artifacts exist while auto_resume is disabled; use --fresh to archive them "
+                "before starting a new run"
+            )
         fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return None, last_path, {"resumed": False, "source": None, "auto_resume": False}
     if last_path.is_file():
@@ -456,6 +564,12 @@ def prepare_resume(
         print(f"Resuming from {last_path} at global_step={step}", flush=True)
         fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return last_path, last_path, {"resumed": True, "source": str(last_path), "start_global_step": step}
+    stale_paths = [fingerprint_path, best_path, best_state_path, final_path]
+    if any(path.is_file() for path in stale_paths):
+        raise RuntimeError(
+            "Checkpoint artifacts exist without last.ckpt; use --fresh to archive them before "
+            "starting a new run"
+        )
     fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
     return None, last_path, {"resumed": False, "source": None}
 
@@ -596,10 +710,15 @@ def train(config: dict, *, fresh: bool = False) -> None:
     model = load_base_model(config, warmup_steps=warmup_steps, total_steps=optimizer_steps)
     tensorboard_logger = make_tensorboard_logger(config)
     log_resume_info(tensorboard_logger, resume_info)
-    subset_callback = make_validation_subset_callback(
-        config, module, micro_batch, Path(tensorboard_logger.log_dir)
-    )
     checkpointing = config.get("checkpointing", {})
+    _, best_path, final_path = _checkpoint_paths(config, output_dir)
+    subset_callback = make_validation_subset_callback(
+        config,
+        module,
+        micro_batch,
+        Path(tensorboard_logger.log_dir),
+        best_path,
+    )
     rolling_callback = RollingCheckpointCallback(
         last_path=last_path,
         interval_optimizer_steps=int(checkpointing.get("rolling_interval_optimizer_steps", 2000)),
@@ -622,7 +741,8 @@ def train(config: dict, *, fresh: bool = False) -> None:
         enable_checkpointing=False,
     )
     trainer.fit(model, datamodule=module, ckpt_path=str(resume_path) if resume_path else None)
-    final_path = Path(checkpointing.get("final_path", output_dir / "final.ckpt"))
+    if not best_path.is_file():
+        raise RuntimeError("Training completed without producing best.ckpt")
     _atomic_save_checkpoint(trainer, final_path)
     metadata = {
         "num_negatives": config["preference"]["num_negatives"],
@@ -633,6 +753,8 @@ def train(config: dict, *, fresh: bool = False) -> None:
         "effective_batch_size": micro_batch * accumulation,
         "warmup_steps": warmup_steps,
         "total_optimizer_steps": optimizer_steps,
+        "scheduler": config["training"].get("scheduler", "cosine"),
+        "min_learning_rate": config["training"].get("min_learning_rate", 0.0),
         "tensorboard_run_dir": tensorboard_logger.log_dir,
         "val_subset_indices_path": str(Path(tensorboard_logger.log_dir) / "val_subset_indices.json"),
         "train_log_every_n_steps": config["logging"]["train_log_every_n_steps"],
@@ -642,6 +764,9 @@ def train(config: dict, *, fresh: bool = False) -> None:
         "rolling_interval_optimizer_steps": rolling_callback.interval_optimizer_steps,
         "auto_resume": bool(checkpointing.get("auto_resume", True)),
         "last_checkpoint_path": str(last_path),
+        "best_checkpoint_path": str(best_path),
+        "best_val_subset_total_loss": subset_callback.best_loss,
+        "best_optimizer_step": subset_callback.best_step,
         "final_checkpoint_path": str(final_path),
         "resume": resume_info,
         "run_fingerprint_sha256": fingerprint["sha256"],
@@ -654,8 +779,7 @@ def validate_last(config: dict) -> None:
     torch.set_float32_matmul_precision("high")
     checkpointing = config.get("checkpointing", {})
     output_dir = Path(config["training"]["output_dir"])
-    last_path = Path(checkpointing.get("last_path", output_dir / "last.ckpt"))
-    final_path = Path(checkpointing.get("final_path", output_dir / "final.ckpt"))
+    last_path, _, final_path = _checkpoint_paths(config, output_dir)
     if not last_path.is_file():
         raise FileNotFoundError(f"Rolling checkpoint not found: {last_path}")
     calibration_path = Path(config["calibration"]["output_json"])
@@ -820,7 +944,11 @@ def subset_smoke_train(config: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_logger = make_tensorboard_logger(config)
     subset_callback = make_validation_subset_callback(
-        config, module, 2, Path(tensorboard_logger.log_dir)
+        config,
+        module,
+        2,
+        Path(tensorboard_logger.log_dir),
+        output_dir / "best.ckpt",
     )
     trainer = pl.Trainer(
         accelerator="gpu",
