@@ -648,7 +648,7 @@ def choose_batch_size(config: dict) -> tuple[int, int]:
         raise RuntimeError("Preference training requires BF16-capable CUDA hardware")
     torch.set_float32_matmul_precision("high")
     training = config["training"]
-    candidates = [8, 16]
+    candidates = [8, 16, 32, 64, 128]
     selected = 4
     for batch_size in candidates:
         torch.cuda.empty_cache()
