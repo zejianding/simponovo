@@ -400,6 +400,12 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
                         # print("beamscore:",beamscores[i])
                         #print("skip CTC length control")
                         
+                    elif abs(mass_true - 1.00335 - pred_mass) < self.mass_control_tol:
+                        # Allow one M+1 isotope error before invoking PMC.
+                        # mass_true and pred_mass are neutral masses, so the
+                        # isotope shift is 1.00335 Da rather than 1.00335 / charge.
+                        top_tokens[i] = top_tokens_beam[i]
+
                     else:
                         #ctc_customized_mass_control = CTCMassControl(self.decoder )
                         # print("I am CUDA program")
