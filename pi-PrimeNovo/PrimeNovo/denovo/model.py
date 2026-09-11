@@ -157,7 +157,7 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
     ):
         super().__init__()
         self.mass_control_tol = mass_control_tol
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["enable_inference_decoder"])
         self.ctc_dic = ctc_dic
         self.PMC_enable = PMC_enable
 
