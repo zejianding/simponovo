@@ -3,6 +3,7 @@ import numpy as np
 import time
 import torch
 import sys
+import math
 
 # inference_kernel = cp.RawKernel(
 # r'''
@@ -213,7 +214,9 @@ def knapDecode(prob, preMass, tol):
     prob = torch.where(prob < -20.0, -20.0, prob)
     #print(prob)
     #print(prob.min())
-    prob = prob - prob.min() + 0.1
+    min_val = prob.min()
+    c = float((-min_val + 0.1).item())
+    prob = prob - min_val + 0.1
     prob = prob.cpu().numpy().astype(np.float32)
     # print(prob)
     prob = cp.array(prob,dtype=cp.float32)
@@ -228,6 +231,10 @@ def knapDecode(prob, preMass, tol):
     inference_kernel((length,),(word_num + 1,),(prob,ans,AAmasses,dpProb,dpMass,dpLock,preMass,length,grid_size, tol))
     ans = ans.get()
     dpMass = dpMass.get()
+    dpProb_host = dpProb.get()
+    dp_kernel_final = float(dpProb_host[length-1, word_num])
+    dp_log_restored = dp_kernel_final - word_num * c
+    dp_path_prob = 0.0 if dp_log_restored < -745 else math.exp(dp_log_restored)
     # # print(ans[:,4,1:])
     # print(ans[length-1,word_num,1:])
     #print("desired mass:", preMass)
@@ -240,7 +247,7 @@ def knapDecode(prob, preMass, tol):
     #print("result:", result)
     sys.stdout.flush()
     
-    return result.tolist()
+    return result.tolist(), dp_path_prob
 
 
 
