@@ -1,6 +1,7 @@
 """A de novo peptide sequencing model."""
 #true model for PrimeNovo
 import heapq
+import math
 import threading
 import logging
 import re
@@ -15,7 +16,9 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch.utils.tensorboard import SummaryWriter
+from . import mass_con
 from ..components import ModelMixin, PeptideDecoder, SpectrumEncoder
+from .ctc_beam_search import CTCBeamSearchDecoder
 from . import evaluate
 aa2mas = { 'G': 57.021464, 'A': 71.037114, 'S': 87.032028, 'P': 97.052764, 'V': 99.068414, 'T': 101.04767, 'C+57.021': 160.030649, 'L': 113.084064, 'I': 113.084064, 'N': 114.042927, 'D': 115.026943, 'Q': 128.058578, 'K': 128.094963, 'E': 129.042593, 'M': 131.040485, 'H': 137.058912, 'F': 147.068414, 'R': 156.101111, 'Y': 163.063329, 'W': 186.079313, 'M+15.995': 147.0354, 'N+0.984': 115.026943, 'Q+0.984': 129.042594, '+42.011': 42.010565, '+43.006': 43.005814, '-17.027': 100000, '+43.006-17.027': 25.980265, "_":0}
 
@@ -152,14 +155,15 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
         out_writer = None,
         ctc_dic: dict = {},
         PMC_enable = True,
-        enable_inference_decoder: bool = True,
+        export_candidates: bool = False,
         **kwargs: Dict,
     ):
         super().__init__()
         self.mass_control_tol = mass_control_tol
-        self.save_hyperparameters(ignore=["enable_inference_decoder"])
+        self.save_hyperparameters()
         self.ctc_dic = ctc_dic
         self.PMC_enable = PMC_enable
+        self.export_candidates = export_candidates
 
         #assert PMC_enable == False
         self.ctc_dic["beam"] = n_beams
@@ -190,12 +194,7 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
         )
         self.n_layers = n_layers
         #self.ctc_customized_mass_control = CTCMassControl(self.decoder )
-        self.enable_inference_decoder = enable_inference_decoder
-        self.ctc_decoder = None
-        if self.enable_inference_decoder:
-            # ctcdecode is optional during Windows preference training.
-            from .ctc_beam_search import CTCBeamSearchDecoder
-            self.ctc_decoder = CTCBeamSearchDecoder(self.decoder, self.ctc_dic)
+        self.ctc_decoder = CTCBeamSearchDecoder(self.decoder, self.ctc_dic)
         self.calctime = 0.0
         #print("ctc_decoder:", self.ctc_decoder)
         '''
@@ -245,7 +244,7 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
 
     def forward(
             self, spectra: torch.Tensor,
-            precursors: torch.Tensor, true_peps) -> Tuple[List[List[str]], torch.Tensor]:
+            precursors: torch.Tensor, true_peps, return_candidates: bool = False) -> Tuple[List[List[str]], torch.Tensor]:
         """
         Predict peptide sequences for a batch of MS/MS spectra.
 
@@ -268,12 +267,6 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
         aa_scores : torch.Tensor of shape (n_spectra, length, n_amino_acids)
             The individual amino acid scores for each prediction.
         """
-        if self.ctc_decoder is None:
-            raise RuntimeError(
-                "Inference decoding is disabled. Load the model with "
-                "enable_inference_decoder=True on an environment that has ctcdecode installed."
-            )
-
         output_decoded_saved = []
         output_logits, _, output_list = self.decoder(None, precursors, *self.encoder(spectra))
         
@@ -315,10 +308,39 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
         #----------explain_--------
         
         #output_logits, _, _ = self.decoder(None, precursors, *self.encoder(spectra))
-        top_tokens, beamscores = self.ctc_decoder.decode(F.softmax(output_logits, -1))
-        batchscores = beamscores.tolist()
-        batchscores = 1 / torch.exp(beamscores)
+        beam_results, all_beam_scores, out_lens = self.ctc_decoder.decode_all(
+            F.softmax(output_logits, -1)
+        )
+        top_tokens = beam_results[:, 0, :].clone()
+        top_beam_len = out_lens[:, 0]
+        mask = torch.arange(0, top_tokens.size(1)).type_as(top_beam_len).repeat(
+            top_beam_len.size(0), 1
+        ).lt(top_beam_len.unsqueeze(1))
+        top_tokens[~mask] = self.decoder.get_pad_idx()
+        beamscores = all_beam_scores[:, 0]
+        beam_scores = (1 / torch.exp(beamscores)).tolist()
+        dp_scores = [float("nan")] * output_logits.shape[0]
         top_tokens_beam = top_tokens.tolist()
+        candidates = scores_raw = scores = None
+        if return_candidates:
+            candidates, scores_raw, scores = [], [], []
+            for spectrum_beams, spectrum_scores, spectrum_lengths in zip(
+                beam_results, all_beam_scores, out_lens
+            ):
+                candidate_row = []
+                score_raw_row = []
+                score_row = []
+                for tokens, score_raw, length in zip(
+                    spectrum_beams, spectrum_scores, spectrum_lengths
+                ):
+                    sequence = self.decoder.detokenize_truth(tokens[:int(length)].tolist(), True)
+                    raw_score = float(score_raw)
+                    candidate_row.append("".join(sequence))
+                    score_raw_row.append(raw_score)
+                    score_row.append(float(math.exp(-raw_score)))
+                candidates.append(candidate_row)
+                scores_raw.append(score_raw_row)
+                scores.append(score_row)
         #input_lengths = torch.full(size=(output_logits.size()[0],), fill_value=output_logits.size()[1])
         #top_tokens = self.ctc_customized_mass_control.decode(F.log_softmax(output_logits, -1),  precursors[:, 0])
         ''''''
@@ -359,11 +381,11 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
                 if "hello" in "".join(token_true):
                     #ctc_customized_mass_control = CTCMassControl(self.decoder )
                     #top_tokens[i] = ctc_customized_mass_control.decode(logits, mass)[0]
-                    from . import mass_con
-                    temp = mass_con.knapDecode(logits, mass)
-                    temp =  ctc_post_processing(temp)
+                    raw, dp_path_prob = mass_con.knapDecode(logits, mass, self.mass_control_tol)
+                    temp =  ctc_post_processing(raw)
                     if temp:
                         top_tokens[i] = temp
+                        dp_scores[i] = float(dp_path_prob)
                         token_temp = [self.decoder._idx2aa[each] for each in temp]
                         token_temp = list(reversed(token_temp))
                         print("truth: ", token_true)
@@ -401,43 +423,22 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
                         #print("skip CTC length control")
                         
                     elif abs(mass_true - 1.00335 - pred_mass) < self.mass_control_tol:
-                        # Allow one M+1 isotope error before invoking PMC.
-                        # mass_true and pred_mass are neutral masses, so the
-                        # isotope shift is 1.00335 Da rather than 1.00335 / charge.
+                        # If the monoisotopic mass check fails, allow one M+1
+                        # isotope error before invoking PMC.  mass_true and
+                        # pred_mass are neutral masses, so the isotope shift
+                        # is 1.00335 Da rather than 1.00335 / charge.
                         top_tokens[i] = top_tokens_beam[i]
 
                     else:
                         #ctc_customized_mass_control = CTCMassControl(self.decoder )
                         # print("I am CUDA program")
-                        # CuPy/PMC is only needed on inference-capable systems.
-                        from . import mass_con
-                        temp = mass_con.knapDecode(logits, mass, self.mass_control_tol)
-                        # knapscores = torch.exp(_)
-                        # indTemp = torch.tensor(temp)
-                        # knapscores = torch.softmax(output_logits,-1)[0]
-                        # knapscores = knapscores[torch.arange(40),indTemp]
-                        # scoreTemp = 1.0
-                        # for x in knapscores:
-                        #     scoreTemp *= x
-                        # if scoreTemp == 0.0:
-                        #     print("I am CUDA program")
-                        #     print(knapscores)
-                        # knapscores = scoreTemp
-                        # knapscore = torch.sum(knapscores)
-                        # knapscores = torch.exp(knapscore)
-                        # print("knapscore:",torch.exp(_))
-                        temp =  ctc_post_processing(temp)
+                        raw, dp_path_prob = mass_con.knapDecode(logits, mass, self.mass_control_tol)
+                        temp = ctc_post_processing(raw)
                         if temp:
                             top_tokens[i] = temp
-                            # batchscores[i] = knapscores
-                            token_temp = [self.decoder._idx2aa[each] for each in temp]
-                            token_temp = list(reversed(token_temp))
-                            # print("truth: ", true_peps[i])
-                            # print("inf: " , token_temp)
-                            # sys.stdout.flush()
+                            dp_scores[i] = float(dp_path_prob)
                         else:
                             top_tokens[i] = top_tokens_beam[i]
-                            #batchscores[i] = 1 / torch.exp(beamscores[i]) #commented score
                         #sequence0 = list(filter((self.decoder.get_pad_idx()).__ne__, top_tokens[i]))
                         #token_true = [self.decoder._idx2aa[each] for each in sequence0]
                         #print("".join(reversed(token_true)))
@@ -458,7 +459,10 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
         
         #-------------------
         #top_tokens = top_tokens.tolist()
-        return [self.decoder.detokenize_truth(t, True) for t in top_tokens], batchscores
+        peptides = [self.decoder.detokenize_truth(t, True) for t in top_tokens]
+        if return_candidates:
+            return peptides, beam_scores, dp_scores, candidates, scores_raw, scores
+        return peptides, beam_scores, dp_scores
 
         '''
         aa_scores, tokens = self.beam_search_decode(  #to do 
@@ -676,7 +680,7 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
 
         if(self.n_beams>0):
             # print("Beam Search: 5")
-            peptides_pred_raw, inferscores = self.forward(batch[0], batch[1], batch[2])
+            peptides_pred_raw, beam_scores, dp_scores = self.forward(batch[0], batch[1], batch[2])
             # print("inferscores:",inferscores)
             # FIXME: Temporary fix to skip predictions with multiple stop tokens.
             peptides_pred, peptides_true = [], []
@@ -782,11 +786,17 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
             The individual amino acid scores for each prediction.
         """
   
-        peptides , inferscores = self.forward(batch[0], batch[1], batch[2])
+        prediction = self.forward(
+            batch[0], batch[1], batch[2], return_candidates=self.export_candidates
+        )
+        if self.export_candidates:
+            peptides, beam_scores, dp_scores, candidates, scores_raw, scores = prediction
+        else:
+            peptides, beam_scores, dp_scores = prediction
         import os
-        
+
         file_path = "./denovo.tsv"
-        headers = "label\tprediction\tcharge\tscore\n"
+        headers = "label\tprediction\tcharge\tbeam_score\tdp_score\n"
 
         # Check if the file exists and whether it contains headers
         if not os.path.exists(file_path) or open(file_path, 'r').readline().strip() != headers.strip():
@@ -814,10 +824,17 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
                 else:
                     answer_is_correct = "incorrect"
                 #each line output this: label (title if label is none), predictions, charge, and confidence score
-                f.write(batch[2][i].replace("\t", " ") + "\t" + sequence + "\t" + str(int(batch[1][i][1])) + "\t" + str(float(inferscores[i])) + "\n")
+                f.write(batch[2][i].replace("\t", " ") + "\t" + sequence + "\t" + str(int(batch[1][i][1])) + "\t" + str(float(beam_scores[i])) + "\t" + str(float(dp_scores[i])) + "\n")
                 
                 #f.write("label: " + batch[2][i] + " prediction : " + "".join(peptides[i]) + "  " + answer_is_correct + "\n")
         
+        if self.export_candidates:
+            return {
+                "scan_id": [str(scan_id) for scan_id in batch[2]],
+                "candidates": candidates,
+                "scores_raw": scores_raw,
+                "scores": scores,
+            }
         return batch[2], batch[1], peptides  #batch[2]: identifier
     
     def on_train_epoch_end(self) -> None:
@@ -1016,7 +1033,7 @@ class Spec2Pep(pl.LightningModule, ModelMixin):
                                              max_iters=self.max_iters)
         return [optimizer], {"scheduler": lr_scheduler, "interval": "step"}
 
-    def on_before_optimizer_step(self, optimizer, optimizer_idx=None):
+    def on_before_optimizer_step(self, optimizer, optimizer_idx):
         total_norm = 0.0
         for p in self.parameters():
             if p.grad is not None:
@@ -1144,5 +1161,4 @@ def _calc_mass_error(calc_mz: float,
         The mass error in ppm.
     """
     return (calc_mz - (obs_mz - isotope * 1.00335 / charge)) / obs_mz * 10**6
-
 

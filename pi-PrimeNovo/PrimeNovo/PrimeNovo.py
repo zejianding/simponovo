@@ -73,6 +73,12 @@ logger = logging.getLogger("PrimeNovo")
     "(optionally) prediction results (extension: .csv).",
     type=click.Path(dir_okay=False),
 )
+@click.option(
+    "--save_candidates",
+    is_flag=True,
+    default=False,
+    help="Save all raw CTC beam candidates to <output>.parquet during denovo prediction.",
+)
 def main(
     mode: str,
     model: Optional[str],
@@ -81,6 +87,7 @@ def main(
     peak_path_test: Optional[str],
     config: Optional[str],
     output: Optional[str],
+    save_candidates: bool,
 ):
    
     # print("hello xiang")
@@ -181,6 +188,7 @@ def main(
     LightningLite.seed_everything(seed=config["random_seed"], workers=True)
 
     # Log the active configuration.
+    logger.debug("save_candidates = %s", save_candidates)
     logger.debug("mode = %s", mode)
     logger.debug("model = %s", model)
     logger.debug("peak_path = %s", peak_path)
@@ -198,7 +206,14 @@ def main(
         # writer.set_metadata(
         #     config, peak_path=peak_path, model=model, config_filename=config_fn
         # )
-        model_runner.predict(peak_path, model, config, writer)
+        model_runner.predict(
+            peak_path,
+            model,
+            config,
+            writer,
+            output=output,
+            save_candidates=save_candidates,
+        )
         #writer.save()
     elif mode == "eval":
         logger.info("Evaluate a trained PrimeNovo model.")

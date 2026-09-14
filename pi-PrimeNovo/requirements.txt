@@ -79,6 +79,7 @@ numpy==1.23.5
 oauthlib==3.2.1
 packaging==22.0
 pandas==1.5.2
+pyarrow==24.0.0
 parso==0.8.3
 pexpect==4.8.0
 pickleshare==0.7.5
@@ -153,4 +154,3 @@ wurlitzer==3.0.3
 yapf==0.32.0
 yarl==1.8.2
 lmdb
-pyarrow>=14.0.0

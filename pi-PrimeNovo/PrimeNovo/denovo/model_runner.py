@@ -29,6 +29,8 @@ def predict(
     model_filename: str,
     config: Dict[str, Any],
     out_writer: None,
+    output: Optional[str] = None,
+    save_candidates: bool = False,
 ) -> None:
     """
     Predict peptide sequences with a trained primenovo model.
@@ -44,7 +46,15 @@ def predict(
     out_writer : ms_io.MztabWriter
         The mzTab writer to export the prediction results.
     """
-    _execute_existing(peak_path, model_filename, config, False, out_writer)
+    _execute_existing(
+        peak_path,
+        model_filename,
+        config,
+        False,
+        out_writer,
+        output=output,
+        save_candidates=save_candidates,
+    )
 
 
 def evaluate(peak_path: str, model_filename: str, config: Dict[str,
@@ -70,6 +80,8 @@ def _execute_existing(
     config: Dict[str, Any],
     annotated: bool,
     out_writer = None,
+    output: Optional[str] = None,
+    save_candidates: bool = False,
 ) -> None:
     """
     Predict peptide sequences with a trained primenovo model with/without
@@ -89,6 +101,24 @@ def _execute_existing(
     out_writer : Optional[ms_io.MztabWriter]
         The mzTab writer to export the prediction results.
     """
+    if save_candidates and annotated:
+        raise ValueError("Candidate export is only available in denovo prediction mode")
+    if save_candidates and output is None:
+        raise ValueError("Candidate export requires an output base path")
+
+    candidate_writer = None
+    if save_candidates:
+        try:
+            from .candidate_writer import CandidateParquetWriter
+        except ModuleNotFoundError as exc:
+            if exc.name == "pyarrow":
+                raise ModuleNotFoundError(
+                    "Candidate export requires pyarrow==24.0.0. "
+                    "Install it with: pip install pyarrow==24.0.0"
+                ) from exc
+            raise
+        candidate_writer = CandidateParquetWriter(f"{output}.parquet")
+
     # Load the trained model.
     if not os.path.isfile(model_filename):
         logger.error(
@@ -116,7 +146,9 @@ def _execute_existing(
         n_beams=config["n_beams"],
         n_log=config["n_log"],
         out_writer=out_writer,
+        export_candidates=save_candidates,
     )
+    model.export_candidates = save_candidates
     # Read the MS/MS spectra for which to predict peptide sequences.
     if annotated:
         peak_ext = (".mgf", ".h5", ".hdf5")
@@ -177,17 +209,32 @@ def _execute_existing(
         enable_model_summary=True,
         accelerator="auto",
         auto_select_gpus=True,
-        devices=_get_devices(),
+        devices=1 if save_candidates else _get_devices(),
         logger=config["logger"],
         max_epochs=config["max_epochs"],
         num_sanity_val_steps=config["num_sanity_val_steps"],
-        strategy=_get_strategy(),
+        strategy=None if save_candidates else _get_strategy(),
+        callbacks=[candidate_writer] if candidate_writer is not None else None,
     )
     # Run the model with/without validation.
     run_trainer = trainer.validate if annotated else trainer.predict
     pytorch_total_params = sum(p.numel() for p in model.parameters())
     print("model size is : ", pytorch_total_params)
-    run_trainer(model,test_dataloader )
+    try:
+        if annotated:
+            run_trainer(model, test_dataloader)
+        else:
+            run_trainer(
+                model,
+                test_dataloader,
+                return_predictions=False if save_candidates else None,
+            )
+        if candidate_writer is not None:
+            candidate_writer.finalize(len(test_dataloader.dataset))
+    except Exception:
+        if candidate_writer is not None:
+            candidate_writer.abort()
+        raise
     # Clean up temporary files.
     tmp_dir.cleanup()
 

@@ -50,7 +50,7 @@ class CTCBeamSearchDecoder(CTCDecoderBase):
         if log_prob.dtype != torch.float16:
             log_prob = log_prob.cpu() 
         '''
-        beam_results, beam_scores, timesteps, out_lens = self.decoder.decode(log_prob)
+        beam_results, beam_scores, out_lens = self.decode_all(log_prob)
         top_beam_tokens = beam_results[:, 0, :]  # extract the most probable beam
         top_beam_len = out_lens[:, 0]
         mask = torch.arange(0, top_beam_tokens.size(1)).type_as(top_beam_len). \
@@ -68,3 +68,8 @@ class CTCBeamSearchDecoder(CTCDecoderBase):
             top_beam_tokens[i] = current_summary_index
         '''
         return top_beam_tokens, beam_scores[:,0] # then use truth decoding from decoder to get the results
+
+    def decode_all(self, log_prob: TensorType):
+        """Return every CTC beam and its valid length without post-processing."""
+        beam_results, beam_scores, _timesteps, out_lens = self.decoder.decode(log_prob)
+        return beam_results, beam_scores, out_lens
