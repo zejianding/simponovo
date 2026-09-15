@@ -270,22 +270,127 @@ def _atomic_save_checkpoint(trainer: pl.Trainer, path: Path) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
-class RollingCheckpointCallback(Callback):
-    """Keep one atomically replaced, fully resumable rolling checkpoint."""
+def _copy_checkpoint_atomically(source: Path, destination: Path) -> None:
+    """Publish a copy of an existing checkpoint at ``destination`` atomically."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(str(destination) + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        shutil.copy2(source, temporary_path)
+        with temporary_path.open("r+b") as handle:
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(destination))
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
-    def __init__(self, last_path: str | Path, interval_optimizer_steps: int) -> None:
+
+def _atomic_link_checkpoint(source: Path, destination: Path) -> None:
+    """Point ``destination`` at ``source`` without duplicating its bytes.
+
+    A hardlink shares the checkpoint data, so keeping ``last.ckpt`` in sync with
+    the newest step archive costs no additional disk space.  Filesystems that do
+    not support hardlinks (or cross-device layouts) fall back to a copy.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = Path(str(destination) + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(source, temporary_path)
+        except OSError:
+            shutil.copy2(source, temporary_path)
+            with temporary_path.open("r+b") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+        os.replace(str(temporary_path), str(destination))
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def publish_best_from_last_checkpoint(
+    last_path: Path,
+    best_path: Path,
+    subset_callback: "PeriodicValidationSubsetCallback | None" = None,
+    *,
+    reason: str,
+) -> None:
+    """Copy the rolling checkpoint to best.ckpt when no best checkpoint exists.
+
+    Short runs can finish before ``val_subset_interval_optimizer_steps`` is
+    reached, so the periodic validation callback never writes a best
+    checkpoint.  Promoting ``last.ckpt`` keeps ``best.ckpt`` available for
+    downstream evaluation while recording that it was copied rather than
+    measured.  The companion ``.json`` state is written as well so a later
+    resume does not trip the best/state consistency check.
+    """
+    if not last_path.is_file():
+        raise RuntimeError(
+            "Training completed without producing best.ckpt or last.ckpt"
+        )
+    _copy_checkpoint_atomically(last_path, best_path)
+    if subset_callback is not None:
+        best_loss = subset_callback.best_loss
+        best_step = subset_callback.best_step
+    else:
+        # Validation loss was disabled; keep numeric placeholders so the state
+        # file stays loadable if validation is enabled on a later resume.
+        best_loss = float("inf")
+        best_step = -1
+    _atomic_write_json(
+        Path(str(best_path) + ".json"),
+        {
+            "best_val_subset_total_loss": best_loss,
+            "best_step": best_step,
+            "best_checkpoint_path": str(best_path),
+            "source": reason,
+        },
+    )
+    print(
+        f"\nPublished best checkpoint from {last_path} -> {best_path} ({reason})",
+        flush=True,
+    )
+
+
+class RollingCheckpointCallback(Callback):
+    """Archive a resumable checkpoint every N optimizer steps.
+
+    Each save writes ``<step_checkpoint_dir>/<prefix>_<step>.ckpt`` and keeps
+    ``last_path`` (``last.ckpt``) pointing at the newest archive, so resume and
+    downstream evaluation keep working.  Nothing is pruned: the number of files
+    is controlled purely by the save interval.
+    """
+
+    def __init__(
+        self,
+        last_path: str | Path,
+        interval_optimizer_steps: int,
+        step_checkpoint_dir: str | Path | None = None,
+        step_checkpoint_prefix: str = "step",
+    ) -> None:
         super().__init__()
         if interval_optimizer_steps < 1:
-            raise ValueError("rolling checkpoint interval must be at least one optimizer step")
+            raise ValueError("checkpoint interval must be at least one optimizer step")
         self.last_path = Path(last_path)
         self.interval_optimizer_steps = int(interval_optimizer_steps)
+        self.step_checkpoint_dir = (
+            Path(step_checkpoint_dir)
+            if step_checkpoint_dir is not None
+            else self.last_path.parent
+        )
+        self.step_checkpoint_prefix = str(step_checkpoint_prefix)
         self.last_saved_step = -1
 
     def _publish(self, trainer: pl.Trainer, step: int, reason: str) -> None:
         previous_step = self.last_saved_step
         self.last_saved_step = int(step)
+        step_path = (
+            self.step_checkpoint_dir
+            / f"{self.step_checkpoint_prefix}_{step:07d}.ckpt"
+        )
         try:
-            _atomic_save_checkpoint(trainer, self.last_path)
+            _atomic_save_checkpoint(trainer, step_path)
+            _atomic_link_checkpoint(step_path, self.last_path)
         except Exception:
             self.last_saved_step = previous_step
             raise
@@ -297,9 +402,10 @@ class RollingCheckpointCallback(Callback):
                 experiment.flush()
         next_step = ((step // self.interval_optimizer_steps) + 1) * self.interval_optimizer_steps
         print(
-            f"\nSaved rolling checkpoint: {self.last_path} "
+            f"\nSaved step checkpoint: {step_path} "
             f"(global_step={step}, reason={reason}); "
-            f"next rolling checkpoint at step={next_step}",
+            f"{self.last_path.name} -> {step_path.name}; "
+            f"next checkpoint at step={next_step}",
             flush=True,
         )
 
@@ -492,12 +598,12 @@ def make_run_fingerprint(
     return {"schema_version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "values": values}
 
 
-def _checkpoint_paths(config: dict, output_dir: Path) -> tuple[Path, Path, Path]:
+def _checkpoint_paths(config: dict, output_dir: Path) -> tuple[Path, Path]:
+    """Return the rolling (last) and best checkpoint paths."""
     checkpointing = config.get("checkpointing", {})
     return (
         Path(checkpointing.get("last_path", output_dir / "last.ckpt")),
         Path(checkpointing.get("best_path", output_dir / "best.ckpt")),
-        Path(checkpointing.get("final_path", output_dir / "final.ckpt")),
     )
 
 
@@ -524,18 +630,18 @@ def prepare_resume(
 ) -> tuple[Path | None, Path, dict]:
     checkpointing = config.get("checkpointing", {})
     auto_resume = bool(checkpointing.get("auto_resume", True))
-    last_path, best_path, final_path = _checkpoint_paths(config, output_dir)
+    last_path, best_path = _checkpoint_paths(config, output_dir)
     fingerprint_path = output_dir / "run_fingerprint.json"
     best_state_path = Path(str(best_path) + ".json")
     if fresh:
-        archive_paths = [last_path, best_path, best_state_path, final_path, fingerprint_path]
+        archive_paths = [last_path, best_path, best_state_path, fingerprint_path]
         if any(path.is_file() for path in archive_paths):
             archive_dir = _archive_resume_files(output_dir, archive_paths)
             print(f"Archived previous resume state to {archive_dir}", flush=True)
         fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return None, last_path, {"resumed": False, "source": None}
     if not auto_resume:
-        stale_paths = [last_path, best_path, best_state_path, final_path, fingerprint_path]
+        stale_paths = [last_path, best_path, best_state_path, fingerprint_path]
         if any(path.is_file() for path in stale_paths):
             raise RuntimeError(
                 "Checkpoint artifacts exist while auto_resume is disabled; use --fresh to archive them "
@@ -564,7 +670,7 @@ def prepare_resume(
         print(f"Resuming from {last_path} at global_step={step}", flush=True)
         fingerprint_path.write_text(json.dumps(fingerprint, indent=2), encoding="utf-8")
         return last_path, last_path, {"resumed": True, "source": str(last_path), "start_global_step": step}
-    stale_paths = [fingerprint_path, best_path, best_state_path, final_path]
+    stale_paths = [fingerprint_path, best_path, best_state_path]
     if any(path.is_file() for path in stale_paths):
         raise RuntimeError(
             "Checkpoint artifacts exist without last.ckpt; use --fresh to archive them before "
@@ -648,7 +754,7 @@ def choose_batch_size(config: dict) -> tuple[int, int]:
         raise RuntimeError("Preference training requires BF16-capable CUDA hardware")
     torch.set_float32_matmul_precision("high")
     training = config["training"]
-    candidates = [8, 16, 32, 64, 128]
+    candidates = [8, 16]
     selected = 4
     for batch_size in candidates:
         torch.cuda.empty_cache()
@@ -679,18 +785,48 @@ def choose_batch_size(config: dict) -> tuple[int, int]:
     return selected, accumulation
 
 
-def train(config: dict, *, fresh: bool = False) -> None:
+def load_calibration(config: dict) -> dict:
+    """Read the optional calibration JSON used as a fallback for beta/margin."""
     calibration_path = Path(config["calibration"]["output_json"])
-    if not calibration_path.is_file():
-        raise FileNotFoundError("Run calibration once before training")
-    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    if calibration_path.is_file():
+        return json.loads(calibration_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def resolve_preference_scalars(config: dict, calibration: dict | None = None) -> None:
+    """Resolve preference.beta/target_margin from the YAML configuration.
+
+    ``beta`` and ``target_margin`` are configured directly in the YAML.  The
+    calibration JSON is only consulted as a fallback when a value is left
+    unset, which keeps older configs working while making the YAML
+    authoritative.
+    """
+    fallback = calibration or {}
+    preference = config["preference"]
+    for key in ("beta", "target_margin"):
+        value = preference.get(key)
+        if value is None:
+            value = fallback.get(key)
+        if value is None:
+            raise ValueError(
+                f"preference.{key} must be set in the config YAML "
+                "(or provided through the calibration JSON fallback)"
+            )
+        preference[key] = float(value)
+
+
+def train(config: dict, *, fresh: bool = False) -> None:
+    calibration = load_calibration(config)
     torch.set_float32_matmul_precision("high")
-    config["preference"]["beta"] = calibration["beta"]
-    config["preference"]["target_margin"] = calibration["target_margin"]
+    resolve_preference_scalars(config, calibration)
+    max_epochs = int(config["training"].get("max_epochs", 1))
+    if max_epochs < 1:
+        raise ValueError("training.max_epochs must be a positive integer")
     micro_batch, accumulation = choose_batch_size(config)
     module = make_datamodule(config, micro_batch)
     module.setup("fit")
-    optimizer_steps = math.ceil(len(module.train_dataloader()) / accumulation)
+    steps_per_epoch = math.ceil(len(module.train_dataloader()) / accumulation)
+    optimizer_steps = steps_per_epoch * max_epochs
     warmup_steps = math.ceil(optimizer_steps * config["training"]["warmup_ratio"])
     output_dir = Path(config["training"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -711,14 +847,23 @@ def train(config: dict, *, fresh: bool = False) -> None:
     tensorboard_logger = make_tensorboard_logger(config)
     log_resume_info(tensorboard_logger, resume_info)
     checkpointing = config.get("checkpointing", {})
-    _, best_path, final_path = _checkpoint_paths(config, output_dir)
-    subset_callback = make_validation_subset_callback(
-        config,
-        module,
-        micro_batch,
-        Path(tensorboard_logger.log_dir),
-        best_path,
-    )
+    _, best_path = _checkpoint_paths(config, output_dir)
+    val_subset_enabled = bool(config["logging"].get("val_subset_enabled", True))
+    subset_callback = None
+    if val_subset_enabled:
+        subset_callback = make_validation_subset_callback(
+            config,
+            module,
+            micro_batch,
+            Path(tensorboard_logger.log_dir),
+            best_path,
+        )
+    else:
+        print(
+            "Val subset loss disabled (logging.val_subset_enabled=false); "
+            "best.ckpt will be promoted from last.ckpt.",
+            flush=True,
+        )
     rolling_callback = RollingCheckpointCallback(
         last_path=last_path,
         interval_optimizer_steps=int(checkpointing.get("rolling_interval_optimizer_steps", 2000)),
@@ -727,36 +872,57 @@ def train(config: dict, *, fresh: bool = False) -> None:
         accelerator="gpu",
         devices=1,
         precision="bf16-mixed",
-        max_epochs=1,
+        max_epochs=max_epochs,
         accumulate_grad_batches=accumulation,
         gradient_clip_val=config["training"]["gradient_clip_val"],
         gradient_clip_algorithm="norm",
         num_sanity_val_steps=0,
+        # When validation is disabled, also skip Lightning's built-in
+        # end-of-epoch validation; otherwise the full val pass still runs and
+        # dominates the runtime even though no validation loss is needed.
+        limit_val_batches=0 if not val_subset_enabled else 1.0,
         logger=tensorboard_logger,
         log_every_n_steps=config["logging"]["train_log_every_n_steps"],
         # Save the train state before the periodic subset callback can run; if
         # subset validation fails on the same step, the latest train weights
         # are still recoverable.
-        callbacks=[rolling_callback, subset_callback],
+        callbacks=(
+            [rolling_callback, subset_callback]
+            if subset_callback is not None
+            else [rolling_callback]
+        ),
         enable_checkpointing=False,
     )
     trainer.fit(model, datamodule=module, ckpt_path=str(resume_path) if resume_path else None)
+    best_promoted_from_last = False
     if not best_path.is_file():
-        raise RuntimeError("Training completed without producing best.ckpt")
-    _atomic_save_checkpoint(trainer, final_path)
+        publish_best_from_last_checkpoint(
+            last_path,
+            best_path,
+            subset_callback,
+            reason="rolling_checkpoint_promoted",
+        )
+        best_promoted_from_last = True
     metadata = {
         "num_negatives": config["preference"]["num_negatives"],
-        "beta": calibration["beta"],
-        "target_margin": calibration["target_margin"],
+        "beta": config["preference"]["beta"],
+        "target_margin": config["preference"]["target_margin"],
+        "max_epochs": max_epochs,
         "micro_batch_size": micro_batch,
         "gradient_accumulation_steps": accumulation,
         "effective_batch_size": micro_batch * accumulation,
+        "steps_per_epoch": steps_per_epoch,
         "warmup_steps": warmup_steps,
         "total_optimizer_steps": optimizer_steps,
         "scheduler": config["training"].get("scheduler", "cosine"),
         "min_learning_rate": config["training"].get("min_learning_rate", 0.0),
         "tensorboard_run_dir": tensorboard_logger.log_dir,
-        "val_subset_indices_path": str(Path(tensorboard_logger.log_dir) / "val_subset_indices.json"),
+        "val_subset_enabled": val_subset_enabled,
+        "val_subset_indices_path": (
+            str(Path(tensorboard_logger.log_dir) / "val_subset_indices.json")
+            if subset_callback is not None
+            else None
+        ),
         "train_log_every_n_steps": config["logging"]["train_log_every_n_steps"],
         "val_subset_size": config["logging"]["val_subset_size"],
         "val_subset_seed": config["logging"]["val_subset_seed"],
@@ -765,9 +931,13 @@ def train(config: dict, *, fresh: bool = False) -> None:
         "auto_resume": bool(checkpointing.get("auto_resume", True)),
         "last_checkpoint_path": str(last_path),
         "best_checkpoint_path": str(best_path),
-        "best_val_subset_total_loss": subset_callback.best_loss,
-        "best_optimizer_step": subset_callback.best_step,
-        "final_checkpoint_path": str(final_path),
+        "best_checkpoint_promoted_from_last": best_promoted_from_last,
+        "best_val_subset_total_loss": (
+            subset_callback.best_loss if subset_callback is not None else None
+        ),
+        "best_optimizer_step": (
+            subset_callback.best_step if subset_callback is not None else None
+        ),
         "resume": resume_info,
         "run_fingerprint_sha256": fingerprint["sha256"],
     }
@@ -779,16 +949,11 @@ def validate_last(config: dict) -> None:
     torch.set_float32_matmul_precision("high")
     checkpointing = config.get("checkpointing", {})
     output_dir = Path(config["training"]["output_dir"])
-    last_path, _, final_path = _checkpoint_paths(config, output_dir)
+    last_path, _ = _checkpoint_paths(config, output_dir)
     if not last_path.is_file():
         raise FileNotFoundError(f"Rolling checkpoint not found: {last_path}")
-    calibration_path = Path(config["calibration"]["output_json"])
-    if not calibration_path.is_file():
-        raise FileNotFoundError("Run calibration once before validation")
-    calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
     config = copy.deepcopy(config)
-    config["preference"]["beta"] = calibration["beta"]
-    config["preference"]["target_margin"] = calibration["target_margin"]
+    resolve_preference_scalars(config, load_calibration(config))
     training_metadata_path = output_dir / "training_metadata.json"
     if training_metadata_path.is_file():
         training_metadata = json.loads(training_metadata_path.read_text(encoding="utf-8"))
@@ -814,15 +979,7 @@ def validate_last(config: dict) -> None:
     )
     print(f"Validating rolling checkpoint: {last_path}", flush=True)
     trainer.validate(model, datamodule=module, verbose=True)
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    final_temporary = Path(str(final_path) + ".tmp")
-    final_temporary.unlink(missing_ok=True)
-    try:
-        shutil.copy2(last_path, final_temporary)
-        os.replace(str(final_temporary), str(final_path))
-    finally:
-        final_temporary.unlink(missing_ok=True)
-    print(f"Validation succeeded; copied {last_path} to {final_path}", flush=True)
+    print(f"Validation succeeded for {last_path}", flush=True)
 
 
 def smoke_train(config: dict) -> None:
