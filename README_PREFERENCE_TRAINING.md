@@ -40,7 +40,8 @@ at least `num_negatives` ordered peptides in `negative_peptides`.
 
 `compact-cache` preserves the original LMDBs and validates deterministic
 records before publishing `*.compact.lmdb`; update the config to those files
-after the command succeeds. Calibration writes `reward_calibration.json` once.
+after the command succeeds. Calibration writes `reward_calibration.json` once;
+it is an optional analysis command and never changes training parameters.
 Training automatically resumes from `last.ckpt`; `--fresh` archives the old
 `best.ckpt`, `last.ckpt`, `final.ckpt`, metric state, and fingerprint. If
 training finished its train epoch but validation failed, run:
@@ -75,8 +76,34 @@ Before a long run, the two optional checks are:
 total_loss = simpo_loss + 0.1 * positive_ctc_loss
 ```
 
-The first run uses `K=2`. Pairwise SimPO losses are averaged across the two
-negative peptides.
+The optional negative-suppression term is configured under
+`preference.negative_suppression`:
+
+```text
+total_loss = simpo_loss + positive_ctc_weight * positive_ctc_loss
+           + negative_suppression_weight * negative_suppression_loss
+```
+
+It is disabled by default. When enabled with a positive weight, YAML must
+explicitly provide a finite `threshold`; training never reads a threshold from
+`reward_calibration.json`. The suppression loss reuses the exact normalized
+CTC NLL already computed for SimPO, with no second CTC call or length
+normalization:
+
+```text
+positive_nll = normalized_nll[:, 0]
+negative_nll = normalized_nll[:, 1:]
+gate = negative_nll < positive_nll[:, None]  # gate: violation
+negative_suppression_loss = mean(
+    gate * temperature * softplus((threshold - negative_nll) / temperature)
+)
+```
+
+`threshold` is soft: violating negatives above it still receive a small,
+smoothly decaying loss. `calibrate` reports frozen-base-model NLL quantiles and
+a recommended threshold for manual copy into YAML if desired. The first run
+uses `K=2`, but pairwise SimPO and suppression are averaged over every negative
+and support any configured `K`.
 
 ## Linux inference
 

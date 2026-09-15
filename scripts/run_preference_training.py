@@ -30,6 +30,10 @@ from PrimeNovo.denovo.preference_data import (
     preference_collate,
     read_preference_lmdb_metadata,
 )
+from PrimeNovo.denovo.preference_config import (
+    normalize_negative_suppression_config,
+    validate_negative_suppression_for_training,
+)
 from PrimeNovo.denovo.preference_model import PreferenceSpec2Pep
 
 
@@ -65,6 +69,7 @@ def read_config(path: Path) -> dict:
     config["model"]["residues"] = {
         str(token): float(mass) for token, mass in config["model"]["residues"].items()
     }
+    normalize_negative_suppression_config(config)
     return config
 
 
@@ -72,6 +77,7 @@ def model_kwargs(config: dict, *, warmup_steps: int = 0, total_steps: int = 1) -
     model = config["model"]
     training = config["training"]
     preference = config["preference"]
+    suppression = normalize_negative_suppression_config(config)
     learning_rate = float(training["learning_rate"])
     min_learning_rate = float(training.get("min_learning_rate", 0.0))
     if training.get("scheduler", "cosine") != "cosine":
@@ -97,6 +103,11 @@ def model_kwargs(config: dict, *, warmup_steps: int = 0, total_steps: int = 1) -
         "beta": preference["beta"],
         "target_margin": preference["target_margin"],
         "positive_ctc_weight": preference["positive_ctc_weight"],
+        "negative_suppression_enabled": suppression["enabled"],
+        "negative_suppression_weight": suppression["weight"],
+        "negative_suppression_threshold": suppression["threshold"],
+        "negative_suppression_temperature": suppression["temperature"],
+        "negative_suppression_gate": suppression["gate"],
         "warmup_steps": warmup_steps,
         "total_optimizer_steps": total_steps,
         "cosine_min_lr_ratio": min_learning_rate / learning_rate,
@@ -172,7 +183,13 @@ class PeriodicValidationSubsetCallback(Callback):
             return
         self.last_evaluated_step = step
         was_training = pl_module.training
-        totals = {"total_loss": 0.0, "simpo_loss": 0.0, "positive_ctc_loss": 0.0}
+        totals = {
+            "total_loss": 0.0,
+            "simpo_loss": 0.0,
+            "positive_ctc_loss": 0.0,
+            "negative_suppression_loss": 0.0,
+            "weighted_negative_suppression_loss": 0.0,
+        }
         count = 0
         pl_module.eval()
         try:
@@ -201,6 +218,16 @@ class PeriodicValidationSubsetCallback(Callback):
         writer.add_scalar("monitor/val_subset_simpo_loss", metrics["simpo_loss"], step)
         writer.add_scalar(
             "monitor/val_subset_positive_ctc_loss", metrics["positive_ctc_loss"], step
+        )
+        writer.add_scalar(
+            "monitor/val_subset_negative_suppression_loss",
+            metrics["negative_suppression_loss"],
+            step,
+        )
+        writer.add_scalar(
+            "monitor/val_subset_weighted_negative_suppression_loss",
+            metrics["weighted_negative_suppression_loss"],
+            step,
         )
         if metrics["total_loss"] < self.best_loss:
             previous_loss, previous_step = self.best_loss, self.best_step
@@ -574,6 +601,18 @@ def make_run_fingerprint(
     """Build the immutable configuration identity used for safe resume."""
     training = config["training"]
     preference = config["preference"]
+    suppression = normalize_negative_suppression_config(config)
+    architecture = model_kwargs(config)
+    if not suppression["enabled"]:
+        # Preserve fingerprints produced before this optional feature existed.
+        for key in (
+            "negative_suppression_enabled",
+            "negative_suppression_weight",
+            "negative_suppression_threshold",
+            "negative_suppression_temperature",
+            "negative_suppression_gate",
+        ):
+            architecture.pop(key)
     values = {
         "train_lmdb": _file_fingerprint(config["data"]["train_lmdb"]),
         "val_lmdb": _file_fingerprint(config["data"]["val_lmdb"]),
@@ -590,9 +629,11 @@ def make_run_fingerprint(
         "weight_decay": float(training["weight_decay"]),
         "warmup_steps": int(warmup_steps),
         "total_optimizer_steps": int(optimizer_steps),
-        "model_architecture": _jsonable(model_kwargs(config)),
+        "model_architecture": _jsonable(architecture),
         "residue_vocabulary": _jsonable(config["model"]["residues"]),
     }
+    if suppression["enabled"]:
+        values["negative_suppression"] = _jsonable(suppression)
     values = _jsonable(values)
     encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {"schema_version": 1, "sha256": hashlib.sha256(encoded).hexdigest(), "values": values}
@@ -709,26 +750,51 @@ def calibrate(config: dict) -> dict:
     batch_size = config["calibration"].get("batch_size", 8)
     module = make_datamodule(config, batch_size)
     module.setup("fit")
-    model = load_base_model(config).cuda().eval()
+    # Calibration must describe the frozen initialization, not the training
+    # objective that will later consume its recommended threshold.
+    calibration_config = copy.deepcopy(config)
+    calibration_config["preference"]["negative_suppression"]["enabled"] = False
+    model = load_base_model(calibration_config).cuda().eval()
     margins = []
+    positive_nll_values = []
+    negative_nll_values = []
     sampled_spectra = 0
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for batch in module.train_dataloader():
             spectra = batch["spectra"].cuda(non_blocking=True)
             precursors = batch["precursors"].cuda(non_blocking=True)
             logits, _, _ = model._forward_step(spectra, precursors, batch["positive_peptides"])
-            losses = model.compute_preference_losses(
+            _, normalized_nll = model.score_ctc_candidates(
                 logits, batch["positive_peptides"], batch["negative_peptides"]
             )
-            margins.append(losses["margins"].detach().float().cpu().reshape(-1))
+            positive_nll = normalized_nll[:, 0]
+            negative_nll = normalized_nll[:, 1:]
+            margins.append((negative_nll - positive_nll[:, None]).detach().float().cpu().reshape(-1))
+            positive_nll_values.append(positive_nll.detach().float().cpu())
+            negative_nll_values.append(negative_nll.detach().float().cpu().reshape(-1))
             sampled_spectra += spectra.shape[0]
             if sampled_spectra >= sample_count:
                 break
     values = torch.cat(margins)
+    positive_values = torch.cat(positive_nll_values)
+    negative_values = torch.cat(negative_nll_values)
+    violation_mask = values < 0
+    violation_negative_values = negative_values[violation_mask]
     quantiles = torch.quantile(values, torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9]))
     iqr = float(quantiles[3] - quantiles[1])
     if iqr < 1e-3:
         raise RuntimeError(f"Calibration IQR is too small: {iqr}")
+    negative_quantile_levels = torch.tensor([0.01, 0.05, 0.10, 0.20, 0.25, 0.30, 0.50, 0.75, 0.90])
+    if violation_negative_values.numel() > 0:
+        violation_negative_quantiles = torch.quantile(violation_negative_values, negative_quantile_levels)
+        violation_quantile_payload = {
+            f"q{int(level * 100):02d}": float(value)
+            for level, value in zip(negative_quantile_levels.tolist(), violation_negative_quantiles.tolist())
+        }
+        recommended_threshold = violation_quantile_payload["q20"]
+    else:
+        violation_quantile_payload = {}
+        recommended_threshold = None
     result = {
         "sample_count_spectra": sampled_spectra,
         "sample_count_pair_margins": int(values.numel()),
@@ -740,6 +806,19 @@ def calibrate(config: dict) -> dict:
         "p90": float(quantiles[4]),
         "iqr": iqr,
         "initial_preference_accuracy": float((values > 0).float().mean()),
+        "num_violations": int(violation_mask.sum()),
+        "violation_rate": float(violation_mask.float().mean()),
+        "positive_nll_mean": float(positive_values.mean()),
+        "positive_nll_median": float(positive_values.median()),
+        "negative_nll_mean": float(negative_values.mean()),
+        "negative_nll_median": float(negative_values.median()),
+        "margin_mean": float(values.mean()),
+        "margin_median": float(values.median()),
+        "negative_nll_violation_quantiles": violation_quantile_payload,
+        "recommended_negative_threshold": recommended_threshold,
+        "negative_suppression_score_definition": "CTCLoss(reduction=none) / target_length",
+        "base_checkpoint": _file_fingerprint(config["training"]["base_checkpoint"]),
+        "train_lmdb": _file_fingerprint(config["data"]["train_lmdb"]),
         "beta": 1.0 / iqr,
         "target_margin": 0.25 * iqr,
     }
@@ -819,6 +898,7 @@ def train(config: dict, *, fresh: bool = False) -> None:
     calibration = load_calibration(config)
     torch.set_float32_matmul_precision("high")
     resolve_preference_scalars(config, calibration)
+    validate_negative_suppression_for_training(config)
     max_epochs = int(config["training"].get("max_epochs", 1))
     if max_epochs < 1:
         raise ValueError("training.max_epochs must be a positive integer")
@@ -907,6 +987,7 @@ def train(config: dict, *, fresh: bool = False) -> None:
         "num_negatives": config["preference"]["num_negatives"],
         "beta": config["preference"]["beta"],
         "target_margin": config["preference"]["target_margin"],
+        "negative_suppression": config["preference"]["negative_suppression"],
         "max_epochs": max_epochs,
         "micro_batch_size": micro_batch,
         "gradient_accumulation_steps": accumulation,
@@ -954,6 +1035,7 @@ def validate_last(config: dict) -> None:
         raise FileNotFoundError(f"Rolling checkpoint not found: {last_path}")
     config = copy.deepcopy(config)
     resolve_preference_scalars(config, load_calibration(config))
+    validate_negative_suppression_for_training(config)
     training_metadata_path = output_dir / "training_metadata.json"
     if training_metadata_path.is_file():
         training_metadata = json.loads(training_metadata_path.read_text(encoding="utf-8"))
@@ -984,6 +1066,7 @@ def validate_last(config: dict) -> None:
 
 def smoke_train(config: dict) -> None:
     """Run two optimizer batches and one validation batch on the real cache."""
+    validate_negative_suppression_for_training(config)
     module = make_datamodule(config, batch_size=2)
     module.setup("fit")
     model = load_base_model(config, warmup_steps=1, total_steps=2)
@@ -1012,6 +1095,7 @@ def smoke_train(config: dict) -> None:
 def checkpoint_smoke_train(config: dict) -> None:
     """Verify rolling checkpoint contents with three short train batches."""
     config = copy.deepcopy(config)
+    validate_negative_suppression_for_training(config)
     output_dir = Path(config["training"]["output_dir"]) / "checkpoint_smoke"
     output_dir.mkdir(parents=True, exist_ok=True)
     last_path = output_dir / "last.ckpt"
@@ -1090,6 +1174,7 @@ def workers_preflight(config: dict) -> None:
 def subset_smoke_train(config: dict) -> None:
     """Exercise the periodic validation callback with a tiny fixed subset."""
     config = copy.deepcopy(config)
+    validate_negative_suppression_for_training(config)
     config["logging"]["val_subset_size"] = 16
     config["logging"]["val_subset_interval_optimizer_steps"] = 1
     config["logging"]["run_name_prefix"] = f"{config['logging']['run_name_prefix']}_subset_smoke"

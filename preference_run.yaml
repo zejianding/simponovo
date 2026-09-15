@@ -22,6 +22,12 @@ preference:
   beta: 1.0
   target_margin: 0.0
   positive_ctc_weight: 0.5
+  negative_suppression:
+    enabled: false
+    weight: 0.5
+    threshold: null
+    temperature: 0.01
+    gate: violation
 
 calibration:
   sample_count: 10000

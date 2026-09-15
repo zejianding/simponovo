@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from .model import Spec2Pep
+from .preference_losses import compute_preference_loss_terms
 
 
 class PreferenceSpec2Pep(Spec2Pep):
@@ -24,6 +25,11 @@ class PreferenceSpec2Pep(Spec2Pep):
         beta: float = 1.0,
         target_margin: float = 0.0,
         positive_ctc_weight: float = 0.1,
+        negative_suppression_enabled: bool = False,
+        negative_suppression_weight: float = 0.5,
+        negative_suppression_threshold: float | None = None,
+        negative_suppression_temperature: float = 0.01,
+        negative_suppression_gate: str = "violation",
         warmup_steps: int = 0,
         total_optimizer_steps: int = 1,
         cosine_min_lr_ratio: float = 0.0,
@@ -34,6 +40,24 @@ class PreferenceSpec2Pep(Spec2Pep):
             raise ValueError("num_negatives must be at least one")
         if beta <= 0:
             raise ValueError("beta must be positive")
+        if negative_suppression_weight < 0:
+            raise ValueError("negative suppression weight must be non-negative")
+        if negative_suppression_temperature <= 0:
+            raise ValueError("negative suppression temperature must be positive")
+        if negative_suppression_gate not in {"violation", "none"}:
+            raise ValueError("negative suppression gate must be 'violation' or 'none'")
+        if negative_suppression_threshold is not None and not math.isfinite(
+            negative_suppression_threshold
+        ):
+            raise ValueError("negative suppression threshold must be finite when provided")
+        if (
+            negative_suppression_enabled
+            and negative_suppression_weight > 0
+            and negative_suppression_threshold is None
+        ):
+            raise ValueError(
+                "negative suppression threshold is required when suppression is enabled with weight > 0"
+            )
         if not 0.0 <= cosine_min_lr_ratio <= 1.0:
             raise ValueError("cosine_min_lr_ratio must be between zero and one")
         super().__init__(enable_inference_decoder=enable_inference_decoder, **kwargs)
@@ -41,6 +65,11 @@ class PreferenceSpec2Pep(Spec2Pep):
         self.beta = beta
         self.target_margin = target_margin
         self.positive_ctc_weight = positive_ctc_weight
+        self.negative_suppression_enabled = negative_suppression_enabled
+        self.negative_suppression_weight = negative_suppression_weight
+        self.negative_suppression_threshold = negative_suppression_threshold
+        self.negative_suppression_temperature = negative_suppression_temperature
+        self.negative_suppression_gate = negative_suppression_gate
         self.preference_warmup_steps = warmup_steps
         self.preference_total_optimizer_steps = max(total_optimizer_steps, 1)
         self.cosine_min_lr_ratio = cosine_min_lr_ratio
@@ -125,20 +154,18 @@ class PreferenceSpec2Pep(Spec2Pep):
         rewards, normalized_nll = self.score_ctc_candidates(
             logits, positive_peptides, negative_peptides
         )
-        positive_rewards = rewards[:, 0]
-        negative_rewards = rewards[:, 1:]
-        margins = positive_rewards[:, None] - negative_rewards
-        simpo_loss = -F.logsigmoid(self.beta * (margins - self.target_margin)).mean()
-        positive_ctc_loss = normalized_nll[:, 0].mean()
-        total_loss = simpo_loss + self.positive_ctc_weight * positive_ctc_loss
-        return {
-            "total_loss": total_loss,
-            "simpo_loss": simpo_loss,
-            "positive_ctc_loss": positive_ctc_loss,
-            "positive_rewards": positive_rewards,
-            "negative_rewards": negative_rewards,
-            "margins": margins,
-        }
+        return compute_preference_loss_terms(
+            rewards,
+            normalized_nll,
+            beta=self.beta,
+            target_margin=self.target_margin,
+            positive_ctc_weight=self.positive_ctc_weight,
+            negative_suppression_enabled=self.negative_suppression_enabled,
+            negative_suppression_weight=self.negative_suppression_weight,
+            negative_suppression_threshold=self.negative_suppression_threshold,
+            negative_suppression_temperature=self.negative_suppression_temperature,
+            negative_suppression_gate=self.negative_suppression_gate,
+        )
 
     def _shared_step(self, batch: Dict[str, object], stage: str) -> torch.Tensor:
         spectra = batch["spectra"]
@@ -153,10 +180,18 @@ class PreferenceSpec2Pep(Spec2Pep):
             "total_loss": losses["total_loss"],
             "simpo_loss": losses["simpo_loss"],
             "positive_ctc_loss": losses["positive_ctc_loss"],
+            "negative_suppression_loss": losses["negative_suppression_loss"],
+            "weighted_negative_suppression_loss": losses["weighted_negative_suppression_loss"],
             "positive_reward": losses["positive_rewards"].mean(),
             "negative_reward_mean": losses["negative_rewards"].mean(),
+            "positive_nll_mean": losses["positive_nll"].mean(),
+            "negative_nll_mean": losses["negative_nll"].mean(),
             "reward_margin_mean": losses["margins"].mean(),
             "preference_accuracy": (losses["margins"] > 0).float().mean(),
+            "violation_rate": losses["violation_mask"].float().mean(),
+            "high_confidence_rate": losses["high_confidence_mask"].float().mean(),
+            "negative_suppression_gate_rate": losses["negative_suppression_gate"].mean(),
+            "strong_suppression_rate": losses["strong_suppression_mask"].float().mean(),
         }
         if stage == "train":
             self._accumulate_optimizer_step_metrics(metrics)
@@ -223,7 +258,13 @@ class PreferenceSpec2Pep(Spec2Pep):
         accumulation_steps = int(self.trainer.accumulate_grad_batches)
         if accumulation_steps <= 0:
             raise RuntimeError("accumulate_grad_batches must be positive")
-        loss_names = {"total_loss", "simpo_loss", "positive_ctc_loss"}
+        loss_names = {
+            "total_loss",
+            "simpo_loss",
+            "positive_ctc_loss",
+            "negative_suppression_loss",
+            "weighted_negative_suppression_loss",
+        }
         for name, metric_sum in self._optimizer_step_metric_sums.items():
             if name in loss_names:
                 # Lightning divides every micro-batch loss by the configured
